@@ -1,0 +1,6 @@
+.venv/
+.pytest-cache/
+*.egg-info/
+**/lightning_logs/*
+**/.ipynb_checkpoints/*
+**/__pycache__/
