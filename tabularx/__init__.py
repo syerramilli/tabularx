@@ -2,9 +2,8 @@
 PyTorch reference implementation of the TabM and TabM-mini models.
 """
 
-from .baselines import MLP, TabularResNet
 from .config import MLPConfig, ResNetConfig, TabMConfig
-from .models import TabM, TabMMini
+from .models import MLP, TabM, TabMMini, TabularResNet
 
 __all__ = [
     "MLP",
