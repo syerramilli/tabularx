@@ -1,14 +1,58 @@
 from __future__ import annotations
 
-from dataclasses import replace
-from typing import List, Optional, Sequence, Tuple
+from dataclasses import dataclass, replace
+from typing import List, Literal, Optional, Sequence, Tuple
 
 from torch import Tensor, nn
 
-from .batching import prepare_ensemble_inputs
 from .adapters import AdapterConfig, EnsembleBlock, EnsembleLinear
-from ..config import TabMConfig
+from .batching import prepare_ensemble_inputs
 from ..utils import activation_from_name, normalize_member_indices
+
+
+@dataclass
+class TabMConfig:
+    """
+    Hyper-parameters that fully describe a TabM-style multilayer perceptron.
+
+    Attributes:
+        input_dim: Number of numerical features fed into the backbone.
+        output_dim: Size of the regression/logit head.
+        hidden_dim: Width of every hidden block.
+        num_layers: Number of hidden blocks (referred to as ``N`` in the paper).
+        dropout: Dropout probability applied after every block.
+        activation: Non-linearity used inside the hidden blocks.
+        ensemble_size: Number of implicit submodels ``k``.
+        share_batch: Whether the ``forward`` helper should replicate a single
+            mini-batch across all submodels (the default TabM♠ strategy).
+        dtype: Optional floating point precision hint. The code does not enforce
+            the dtype but exposes it so callers can keep track of the intended
+            precision.
+    """
+
+    input_dim: int
+    output_dim: int
+    hidden_dim: int = 512
+    num_layers: int = 4
+    dropout: float = 0.2
+    activation: Literal["relu"] = "relu"
+    ensemble_size: int = 32
+    share_batch: bool = True
+    dtype: Literal["float32", "bfloat16", "float16"] = "float32"
+
+    def __post_init__(self) -> None:
+        if self.input_dim <= 0:
+            raise ValueError("input_dim must be > 0")
+        if self.output_dim <= 0:
+            raise ValueError("output_dim must be > 0")
+        if self.hidden_dim <= 0:
+            raise ValueError("hidden_dim must be > 0")
+        if self.num_layers <= 0:
+            raise ValueError("num_layers must be > 0")
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError("dropout must lie in [0, 1)")
+        if self.ensemble_size <= 0:
+            raise ValueError("ensemble_size must be > 0")
 
 
 class TabMBase(nn.Module):
