@@ -9,8 +9,7 @@ def compute_quantile_bins(
     max_rows: Optional[int] = None,
 ) -> List[Tensor]:
     """
-    Compute per-feature bin edges using empirical quantiles, similar to the
-    quantile-based branch of `compute_bins` in rtdl-num-embeddings.
+    Compute per-feature bin edges using empirical quantiles
 
     Args:
         X: Tensor of shape (n_samples, n_features).
@@ -59,43 +58,69 @@ def compute_quantile_bins(
 
     return bins
 
-@dataclass
-class PiecewiseLinearEmbeddingConfig:
+class PiecewiseLinearEncoding(nn.Module):
     """
-    Configuration for piecewise linear embeddings for numerical features.
+    Piecewise linear encoding for numerical features 
 
-    Attributes:
-        n_features: Number of numerical input features.
-        d_embedding: Dimensionality of the output embedding for each feature.
-        n_bins: Target number of bins when computing bins from data (e.g. via
-            `compute_quantile_bins`). Not strictly required if you pass
-            explicit bins to the embedding.
+    For each feature j, You provide bin edges: b_0 < b_1 < ... < b_{T_j}. There will be T_j bins. 
+
+    Input shape:  (*, n_features)
+    Output shape: (*, n_features, max_n_bins)
     """
 
-    n_features: int
-    d_embedding: int
-    n_bins: int = 48
+    def __init__(
+        self, bins: List[Tensor]
+    ) -> None:
+        
+        assert(len(bins) > 0)
+        assert(len(bins[0]) > 0)
+        super().__init__()
+        
+        n_features = len(bins)
+        max_n_bins = max([len(l) - 1 for l in bins])
+        # handle different number of features
+        self.register_buffer(
+            'mask',
+            None if all(len(l) == max_n_bins for l in bins)
+            else torch.row_stack([
+                torch.cat([
+                    # number of bins for this feature - 1
+                    torch.ones(len(l) - 1, dtype=torch.bool),
+                    # zero padded components
+                    torch.zeros(max_n_bins - (len(l) - 1), dtype=torch.bool)
+                ]) for l in bins
+            ])
+        )
 
-    def __post_init__(self) -> None:
-        if self.n_features <= 0:
-            raise ValueError("n_features must be > 0")
-        if self.d_embedding <= 0:
-            raise ValueError("d_embedding must be > 0")
-        if self.n_bins <= 0:
-            raise ValueError("n_bins must be > 0")
+        self.register_buffer('weight', torch.zeros(n_features, max_n_bins))
+        self.register_buffer('bias', torch.zeros(n_features, max_n_bins))
+
+        for i, bin_edges in enumerate(bins):
+            n_bins = len(bin_edges) - 1
+            # i is the feature index
+            bin_width = bin_edges.diff()
+
+            self.weight[i, :n_bins] = 1. / bin_width
+            self.bias[i, :n_bins] = -bin_edges[:-1] / bin_width
+        
+    
+    @property
+    def get_max_n_bins(self) -> int:
+        return self.weight.shape[-1]
+    
+    def forward(self, x: torch.Tensor, flatten: bool = False) -> torch.Tensor:
+        x = torch.addcmul(self.bias, self.weight, x[..., None]).clamp(0., 1.)
+        if flatten:
+            x = x.flatten(-2) if self.mask is None else x[:, self.mask]
+        return x
+
 
 class PiecewiseLinearEmbedding(nn.Module):
     """
-    Piecewise linear embedding for numerical features with
-    **precomputed, possibly ragged bins**.
+    Piecewise linear embedding for numerical features.
 
-    For each feature j:
-      - You provide bin edges: e_0 < e_1 < ... < e_{M_j}
-      - There are M_j - 1 bins / intervals
-      - We learn an embedding vector for each edge, and for x in [e_k, e_{k+1}]
-        we linearly interpolate between the embeddings at e_k and e_{k+1}.
-
-    Ragged bins are handled by padding edges to a common max length internally.
+    Applies a PiecewiseLinearEncoding followed by a per-feature linear
+    transformation and optional ReLU activation.
 
     Input shape:  (*, n_features)
     Output shape: (*, n_features, d_embedding)
@@ -103,173 +128,37 @@ class PiecewiseLinearEmbedding(nn.Module):
 
     def __init__(
         self,
-        config: PiecewiseLinearEmbeddingConfig,
-        bins: Optional[Sequence[Tensor]] = None,
+        bins: List[Tensor],
+        d_embedding: int,
+        activation: bool = True,
     ) -> None:
         super().__init__()
-        self.config = config
-        self.n_features = config.n_features
-        self.d_embedding = config.d_embedding
 
-        # ----- Prepare bins -----
-        if bins is None:
-            # Fallback: evenly spaced bins in [-1, 1] per feature.
-            # This keeps your current MLP working even if you don't pass real bins.
-            edges = torch.linspace(-1.0, 1.0, config.n_bins + 1)
-            bins = [edges.clone() for _ in range(self.n_features)]
-        else:
-            if len(bins) != self.n_features:
-                raise ValueError(
-                    f"len(bins) ({len(bins)}) must equal n_features ({self.n_features})"
-                )
+        self.encoding = PiecewiseLinearEncoding(bins)
+        self.d_embedding = d_embedding
+        self.activation = activation
 
-        cleaned_bins: List[Tensor] = []
-        for j, b in enumerate(bins):
-            if b.ndim != 1:
-                raise ValueError(f"bins[{j}] must be 1D, got shape {tuple(b.shape)}")
-            b = b.detach()
-            if not torch.is_floating_point(b):
-                b = b.to(torch.get_default_dtype())
-            # Sort & deduplicate to be safe
-            b_sorted, _ = torch.sort(b)
-            b_unique = b_sorted.unique()
-            if b_unique.numel() < 2:
-                raise ValueError(
-                    f"bins[{j}] must have at least 2 distinct edges, "
-                    f"got {b_unique.numel()}"
-                )
-            cleaned_bins.append(b_unique)
+        n_features = len(bins)
+        max_n_bins = self.encoding.get_max_n_bins
 
-        self._register_bins(cleaned_bins)
-        self._create_parameters()
+        # Linear transformation: (n_features, max_n_bins) -> (n_features, d_embedding)
+        self.linear = nn.Parameter(torch.empty(n_features, max_n_bins, d_embedding))
+        self.bias = nn.Parameter(torch.zeros(n_features, d_embedding))
+        nn.init.xavier_uniform_(self.linear)
 
-    # ---------- internal helpers for ragged bins ----------
+        if activation:
+            self.relu = nn.ReLU()
 
-    def _register_bins(self, bins: Sequence[Tensor]) -> None:
-        """
-        Store ragged bin edges in padded tensors as buffers.
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (*, n_features)
+        # encoded: (*, n_features, max_n_bins)
+        encoded = self.encoding(x)
 
-        After this:
-            self.bin_edges: (n_features, max_n_edges)
-            self.bin_edge_lengths: (n_features,) number of valid edges per feature
-        """
-        n_features = self.n_features
-        edge_lengths = torch.tensor(
-            [int(b.numel()) for b in bins], dtype=torch.long
-        )
-        max_n_edges = int(edge_lengths.max().item())
+        # Apply per-feature linear: (*, n_features, max_n_bins) @ (n_features, max_n_bins, d_embedding)
+        # -> (*, n_features, d_embedding)
+        out = torch.einsum('...fm,fmd->...fd', encoded, self.linear) + self.bias
 
-        # Pad edges along last dimension
-        bin_edges = torch.empty(
-            n_features, max_n_edges, dtype=bins[0].dtype
-        )
-        for j, b in enumerate(bins):
-            L = b.numel()
-            bin_edges[j, :L] = b
-            if L < max_n_edges:
-                # Pad tail with last edge value (won't be used for interpolation)
-                bin_edges[j, L:] = b[-1]
+        if self.activation:
+            out = self.relu(out)
 
-        self.max_n_edges = max_n_edges
-        self.max_n_bins = max_n_edges - 1  # maximum number of intervals
-
-        self.register_buffer("bin_edges", bin_edges)
-        self.register_buffer("bin_edge_lengths", edge_lengths)
-
-    def _create_parameters(self) -> None:
-        """
-        Create learnable boundary embeddings for each feature and edge.
-        Only the first bin_edge_lengths[j] entries are "real" for feature j.
-        """
-        # (n_features, max_n_edges, d_embedding)
-        self.boundary_embeddings = nn.Parameter(
-            torch.empty(
-                self.n_features,
-                self.max_n_edges,
-                self.d_embedding,
-            )
-        )
-        nn.init.xavier_uniform_(self.boundary_embeddings)
-
-    # ---------- forward ----------
-
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Embed numerical features using piecewise linear interpolation.
-
-        Args:
-            x: Tensor of shape (*, n_features).
-
-        Returns:
-            Tensor of shape (*, n_features, d_embedding).
-        """
-        if x.shape[-1] != self.n_features:
-            raise ValueError(
-                f"Expected last dim of x to be {self.n_features}, "
-                f"got {x.shape[-1]}"
-            )
-
-        orig_shape = x.shape
-        batch_dims = orig_shape[:-1]
-
-        # Flatten batch dims: (*, n_features) -> (B, n_features)
-        x_flat = x.reshape(-1, self.n_features)
-        B = x_flat.shape[0]
-
-        device = x_flat.device
-        dtype = x_flat.dtype
-
-        # Move buffers/params to correct device/dtype
-        bin_edges = self.bin_edges.to(device=device, dtype=dtype)
-        bin_edge_lengths = self.bin_edge_lengths
-        boundary_embeddings = self.boundary_embeddings.to(
-            device=device, dtype=dtype
-        )
-
-        # Output: (B, n_features, d_embedding)
-        out = x_flat.new_empty((B, self.n_features, self.d_embedding))
-
-        # Process each feature separately (ragged edges)
-        for j in range(self.n_features):
-            n_edges_j = int(bin_edge_lengths[j].item())
-            n_bins_j = n_edges_j - 1
-
-            edges_j = bin_edges[j, :n_edges_j]         # (n_edges_j,)
-            emb_j = boundary_embeddings[j, :n_edges_j] # (n_edges_j, d_embedding)
-
-            x_j = x_flat[:, j]                         # (B,)
-
-            # Interior edges for bucketization
-            if n_bins_j > 1:
-                inner = edges_j[1:-1]                  # (n_edges_j - 2,)
-                # bin_idx in [0, n_bins_j - 1]
-                bin_idx = torch.bucketize(x_j, inner)
-            else:
-                # Only one bin: everything goes to bin 0
-                bin_idx = torch.zeros_like(x_j, dtype=torch.long)
-
-            # Left/right edges for this bin
-            left_edge = edges_j[bin_idx]               # (B,)
-            right_edge = edges_j[bin_idx + 1]          # (B,)
-
-            # t in [0, 1] for interpolation between edges
-            denom = right_edge - left_edge
-            # Avoid division by zero
-            denom = torch.where(
-                denom.abs() < 1e-8,
-                torch.ones_like(denom),
-                denom,
-            )
-            t = (x_j - left_edge) / denom
-            t = t.clamp(0.0, 1.0)                      # (B,)
-
-            # Edge embeddings
-            left_emb = emb_j[bin_idx]                  # (B, d_embedding)
-            right_emb = emb_j[bin_idx + 1]             # (B, d_embedding)
-
-            t_expanded = t.unsqueeze(1)                # (B, 1)
-            out[:, j, :] = (1.0 - t_expanded) * left_emb + t_expanded * right_emb
-
-        # Reshape back to original batch dims
-        out = out.reshape(*batch_dims, self.n_features, self.d_embedding)
         return out
