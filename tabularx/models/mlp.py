@@ -5,7 +5,7 @@ from typing import List, Literal, Optional
 
 from torch import Tensor, nn
 
-from ..embeddings import PiecewiseLinearEmbedding, PiecewiseLinearEmbeddingConfig
+from ..embeddings import PiecewiseLinearEncoding, PiecewiseLinearEmbedding
 from ..utils import activation_from_name
 
 
@@ -15,19 +15,17 @@ class MLPConfig:
     Configuration for the baseline MLP from Gorishniy et al. (2021).
 
     Attributes:
-        input_dim: Number of numerical features (only used when use_embeddings=False).
+        input_dim: Number of numerical features.
         output_dim: Size of the output layer.
         hidden_dim: Width of hidden layers.
         num_layers: Number of hidden layers.
         dropout: Dropout probability applied after each layer.
         activation: Non-linearity used in hidden layers.
+        use_ple: Whether to use piecewise linear encoding (no learnable params).
         use_embeddings: Whether to use piecewise linear embeddings for input features.
+        use_embedding_activation: Whether to apply ReLU in the embedding layer
+            (only used when use_embeddings=True).
         d_embedding: Embedding dimension per feature (only used when use_embeddings=True).
-        n_bins: Target number of bins for piecewise linear embeddings
-            (used when computing quantile bins, or for uniform bins if
-             precomputed bins are not provided).
-        use_precomputed_bins: If True, the MLP __init__ expects an explicit
-            `bins` argument and will pass it to PiecewiseLinearEmbedding.
     """
 
     input_dim: int
@@ -36,10 +34,10 @@ class MLPConfig:
     num_layers: int = 4
     dropout: float = 0.2
     activation: Literal["relu"] = "relu"
+    use_ple: bool = False
     use_embeddings: bool = False
+    use_embedding_activation: bool = False
     d_embedding: Optional[int] = None
-    n_bins: int = 48
-    use_precomputed_bins: bool = False  # <- new
 
     def __post_init__(self) -> None:
         if self.input_dim <= 0 or self.output_dim <= 0:
@@ -48,11 +46,11 @@ class MLPConfig:
             raise ValueError("hidden_dim/num_layers must be > 0")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must lie in [0, 1)")
+        if self.use_ple and self.use_embeddings:
+            raise ValueError("use_ple and use_embeddings cannot both be True")
         if self.use_embeddings:
             if self.d_embedding is None or self.d_embedding <= 0:
                 raise ValueError("d_embedding must be > 0 when use_embeddings=True")
-            if self.n_bins <= 0:
-                raise ValueError("n_bins must be > 0")
 
 
 class MLP(nn.Module):
@@ -60,10 +58,9 @@ class MLP(nn.Module):
     Consists of ``num_layers`` blocks of ``Dropout(Activation(Linear(. )))`` followed
     by a linear prediction head.
 
-    Optionally supports piecewise linear embeddings for numerical features.
-    When embeddings are enabled, the input is first transformed from
-    (batch, n_features) -> (batch, n_features, d_embedding) -> (batch, n_features * d_embedding)
-    before being passed through the MLP blocks.
+    Optionally supports:
+    - Piecewise linear encoding (use_ple): Fixed transformation, no learnable params.
+    - Piecewise linear embeddings (use_embeddings): Learnable per-feature projections.
     """
 
     def __init__(
@@ -74,36 +71,33 @@ class MLP(nn.Module):
         """
         Args:
             config: MLPConfig instance.
-            bins: Optional list of bin edge tensors, one per feature,
-                to be passed into PiecewiseLinearEmbedding. Only used when
-                config.use_embeddings and config.use_precomputed_bins are True.
+            bins: List of bin edge tensors, one per feature. Required when
+                use_ple=True or use_embeddings=True.
         """
         super().__init__()
         self.config = config
 
-        # Optional embedding layer
+        self.encoding: Optional[PiecewiseLinearEncoding] = None
         self.embedding: Optional[PiecewiseLinearEmbedding] = None
-        if config.use_embeddings:
-            assert config.d_embedding is not None, "d_embedding must be set when use_embeddings=True"
 
-            embed_config = PiecewiseLinearEmbeddingConfig(
-                n_features=config.input_dim,
+        if config.use_ple:
+            if bins is None:
+                raise ValueError("bins must be provided when use_ple=True")
+            self.encoding = PiecewiseLinearEncoding(bins)
+            # Output dim after flatten: sum of (n_edges - 1) per feature
+            in_features = sum(len(b) - 1 for b in bins)
+
+        elif config.use_embeddings:
+            if bins is None:
+                raise ValueError("bins must be provided when use_embeddings=True")
+            assert config.d_embedding is not None
+            self.embedding = PiecewiseLinearEmbedding(
+                bins=bins,
                 d_embedding=config.d_embedding,
-                n_bins=config.n_bins,
+                activation=config.use_embedding_activation,
             )
-
-            if config.use_precomputed_bins:
-                if bins is None:
-                    raise ValueError(
-                        "bins must be provided when use_embeddings=True and "
-                        "use_precomputed_bins=True"
-                    )
-                self.embedding = PiecewiseLinearEmbedding(embed_config, bins=bins)
-            else:
-                # fallback: internally constructed (uniform) bins
-                self.embedding = PiecewiseLinearEmbedding(embed_config)
-
             in_features = config.input_dim * config.d_embedding
+
         else:
             in_features = config.input_dim
 
@@ -133,7 +127,11 @@ class MLP(nn.Module):
         Returns:
             Output tensor of shape (batch, output_dim).
         """
-        if self.embedding is not None:
+        if self.encoding is not None:
+            # x: (batch, n_features) -> (batch, total_bins) via flatten=True
+            x = self.encoding(x, flatten=True)
+
+        elif self.embedding is not None:
             # x: (batch, n_features) -> (batch, n_features, d_embedding)
             x = self.embedding(x)
             # Flatten: (batch, n_features, d_embedding) -> (batch, n_features * d_embedding)
